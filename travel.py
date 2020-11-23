@@ -21,9 +21,8 @@ from couchbase.cluster import QueryOptions
 import couchbase_core.subdocument as SD
 from couchbase.exceptions import DocumentNotFoundException, CouchbaseTransientException, NetworkException, \
     CouchbaseException, PathNotFoundException, CouchbaseDataException
-from couchbase.search import ConjunctionQuery, TermQuery, DisjunctionQuery, SearchOptions, MatchPhraseQuery, \
-    QueryStringQuery, SearchQuery, PrefixQuery, HighlightStyle, SortField, \
-    SortScore, TermFacet
+from couchbase.search import ConjunctionQuery, TermQuery, SearchRow, SearchOptions, MatchPhraseQuery
+
 
 CONNSTR = 'couchbase://localhost'
 USER = 'Administrator'
@@ -93,7 +92,7 @@ class FlightPathsView(FlaskView):
                     WHERE airportname = $2"
 
         # res = db.n1ql_query(N1QLQuery(queryprep, fromloc, toloc))
-        res = cluster.query(queryprep, QueryOptions(positional_parameters=[fromloc,toloc]))
+        res = cluster.query(queryprep, QueryOptions(positional_parameters=[fromloc, toloc]))
         flightpathlist = [x for x in res]
 
         # Extract the 'toAirport' and 'fromAirport' values.
@@ -113,7 +112,7 @@ class FlightPathsView(FlaskView):
         # should produce query with OME, TLA faa codes
         # resroutes = db.n1ql_query(
         #     N1QLQuery(queryroutes, queryto, queryfrom, queryleave))
-        resroutes = cluster.query(queryroutes, QueryOptions(positional_parameters=[queryto, queryfrom, queryleave]))
+        resroutes = cluster.query(queryroutes, QueryOptions(positional_parameters=[queryfrom, queryto, queryleave]))
         routelist = []
         for x in resroutes:
             x['flighttime'] = math.ceil(random() * 8000)
@@ -135,11 +134,13 @@ class UserView(FlaskView):
         userdockey = make_user_key(user)
 
         try:
-            doc_pass = db.retrieve_in(userdockey, 'password')[0]
+            # doc_pass = db.retrieve_in(userdockey, 'password')[0]
+            result = db.lookup_in(userdockey, [SD.get('password')])
+            doc_pass = result.content_as[str](0)
             if doc_pass != password:
                 return abortmsg(401, "Password does not match")
             else:
-                token = jwt.encode({'user': user}, 'cbtravelsample')
+                token = jwt.encode({'user': user}, 'cbtravelsample').decode('utf-8')
                 return jsonify({'data': {'token': token}})
 
         except PathNotFoundException:
@@ -154,7 +155,7 @@ class UserView(FlaskView):
         except CouchbaseException as e:
             print("Unknown Exception detected during login - {}".format(e.rc))
 
-        token = jwt.encode({'user': user}, 'cbtravelsample')
+        token = jwt.encode({'user': user}, 'cbtravelsample').decode('utf-8')
         return jsonify({'data': {'token': token}})
 
     @route('/signup', methods=['POST', 'OPTIONS'])
@@ -167,9 +168,8 @@ class UserView(FlaskView):
 
         try:
             db.upsert(make_user_key(user), userrec)
-            print("User created")
-            token = jwt.encode({'user': user}, 'cbtravelsample')
-            respjson = jsonify({'data': {'token': token.decode('utf-8')}})
+            token = jwt.encode({'user': user}, 'cbtravelsample').decode('utf-8')
+            respjson = jsonify({'data': {'token': token}})
         except CouchbaseDataException as e:
             abort(409)
         response = make_response(respjson)
@@ -179,16 +179,23 @@ class UserView(FlaskView):
     def userflights(self, username):
         """List the flights that have been reserved by a user"""
         if request.method == 'GET':
-            token = jwt.encode({'user': username}, 'cbtravelsample')
+            token = jwt.encode({'user': username}, 'cbtravelsample').decode('utf-8')
             bearer = request.headers['Authentication'].split(" ")[1]
             if token != bearer:
                 return abortmsg(401, 'Username does not match token username')
 
             try:
                 userdockey = make_user_key(username)
-                subdoc = db.retrieve_in(userdockey, 'flights')
-                flights = subdoc.get('flights', [])
-                respjson = jsonify({'data': flights[1]})
+                # subdoc = db.retrieve_in(userdockey, 'flights')
+                result = db.lookup_in(userdockey, [SD.get('flights')])
+                subdoc = result.content_as[list](0)
+
+                if len(subdoc) > 0:
+                    flights = subdoc
+                else:
+                    flights = []
+
+                respjson = jsonify({'data': flights})
                 response = make_response(respjson)
                 return response
             except DocumentNotFoundException:
@@ -197,7 +204,7 @@ class UserView(FlaskView):
         elif request.method == 'POST':
             userdockey = make_user_key(username)
 
-            token = jwt.encode({'user': username}, 'cbtravelsample')
+            token = jwt.encode({'user': username}, 'cbtravelsample').decode('utf-8')
             bearer = request.headers['Authentication'].split(" ")[1]
 
             if token != bearer:
@@ -207,8 +214,8 @@ class UserView(FlaskView):
 
             try:
                 db.mutate_in(userdockey,
-                             SD.array_append('flights',
-                                             newflights, create_parents=True))
+                             [SD.array_append('flights',
+                                             newflights, create_parents=True)])
                 resjson = {'data': {'added': newflights},
                            'context': 'Update document ' + userdockey}
                 return make_response(jsonify(resjson))
@@ -227,10 +234,12 @@ class HotelView(FlaskView):
         # Requires FTS index called 'hotels'
         # TODO auto create index if missing
         # qp = FT.ConjunctionQuery(FT.TermQuery(term='hotel', field='type'))
-        qp = ConjunctionQuery(TermQuery("hotel", SearchOptions(fields=["type"])))
+        qp = ConjunctionQuery(TermQuery("hotel"))
+
         if location != '*':
             qp.conjuncts.append(
-                    MatchPhraseQuery(location, SearchOptions(fields=["country", "city", "state", "address"]))
+                    # MatchPhraseQuery(location, SearchOptions(fields=["country", "city", "state", "address"]))
+                    MatchPhraseQuery(location)
                     # FT.MatchPhraseQuery(location, field='city'),
                     # FT.MatchPhraseQuery(location, field='state'),
                     # FT.MatchPhraseQuery(location, field='address')
@@ -239,22 +248,34 @@ class HotelView(FlaskView):
         if description != '*':
             qp.conjuncts.append(
                 # FT.DisjunctionQuery(
-                    MatchPhraseQuery(description, SearchOptions(fields=['description', 'name']))
+                #     MatchPhraseQuery(description, SearchOptions(fields=['description', 'name']))
+                MatchPhraseQuery(description)
                 )
 
-        q = db.search('hotels', qp, limit=100)
-        results = []
-        for row in q:
-            subdoc = db.retrieve_in(row['id'], 'country', 'city', 'state',
-                                    'address', 'name', 'description')
+        q = cluster.search_query('hotels', qp,
+                                 SearchOptions(limit=100,
+                                               fields=["country", "city", "state",
+                                                       "address", "description", "name"]))
 
-        # Get the fields from the document, if they exist
-        addr = ', '.join(x for x in (
-            subdoc.get(y)[1] for y in ('address', 'city', 'state', 'country')) if x)
-        subresults = {'name': subdoc['name'], 'description': subdoc['description'], 'address': addr}
-        results.append(subresults)
+        results = []
+        for sr in q.rows():
+            # subdoc = db.retrieve_in(row['id'], 'country', 'city', 'state',
+            #                         'address', 'name', 'description')
+            if isinstance(sr, SearchRow):
+                try:
+                    result = db.lookup_in(sr.id, [SD.get('country'), SD.get('city'),
+                                               SD.get('state'), SD.get('address'),
+                                               SD.get('name'), SD.get('description')])
+
+                    addr = result.content_as[str](3) + ", " + result.content_as[str](1) + ", " + \
+                        result.content_as[str](2) + ", " + result.content_as[str](0)
+                    subresults = {'name': result.content_as[str](4), 'description': result.content_as[str](5), 'address': addr}
+                    results.append(subresults)
+                except PathNotFoundException as pe:
+                    print("PathNotFoundException -> {}".format(pe.message))
 
         response = {'data': results}
+
         return jsonify(response)
 
 
