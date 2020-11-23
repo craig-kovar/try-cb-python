@@ -8,24 +8,38 @@ from flask import make_response, redirect
 from flask.views import View
 from flask_classy import FlaskView, route
 
-from couchbase.bucket import Bucket
-from couchbase.n1ql import N1QLQuery
-from couchbase.exceptions import NotFoundError, CouchbaseNetworkError, \
-    CouchbaseTransientError, CouchbaseDataError, SubdocPathNotFoundError
-import couchbase.fulltext as FT
-import couchbase.subdocument as SD
+# from couchbase.bucket import Bucket
+# from couchbase.n1ql import N1QLQuery
+# from couchbase.exceptions import NotFoundError, CouchbaseNetworkError, \
+#     CouchbaseTransientError, CouchbaseDataError, SubdocPathNotFoundError
+# import couchbase.fulltext as FT
+# import couchbase.subdocument as SD
 
-CONNSTR = 'couchbase://localhost/travel-sample'
-PASSWORD = ''
+from couchbase.cluster import Cluster, ClusterOptions
+from couchbase_core.cluster import PasswordAuthenticator
+from couchbase.cluster import QueryOptions
+import couchbase_core.subdocument as SD
+from couchbase.exceptions import DocumentNotFoundException, CouchbaseTransientException, NetworkException, \
+    CouchbaseException, PathNotFoundException, CouchbaseDataException
+from couchbase.search import ConjunctionQuery, TermQuery, DisjunctionQuery, SearchOptions, MatchPhraseQuery, \
+    QueryStringQuery, SearchQuery, PrefixQuery, HighlightStyle, SortField, \
+    SortScore, TermFacet
+
+CONNSTR = 'couchbase://localhost'
+USER = 'Administrator'
+PASSWORD = 'password'
 
 app = Flask(__name__, static_url_path='/static')
+
 
 @app.route('/')
 @app.route('/static/')
 def index():
     return redirect("/static/index.html", code=302)
 
+
 app.config.from_object(__name__)
+
 
 def make_user_key(username):
     return 'user::' + username
@@ -48,7 +62,8 @@ class Airport(View):
             queryprep += "LOWER(airportname) LIKE $1"
             queryargs = ['%' + querystr + '%']
 
-        res = db.n1ql_query(N1QLQuery(queryprep, *queryargs))
+        # res = db.n1ql_query(N1QLQuery(queryprep, *queryargs))
+        res = cluster.query(queryprep, QueryOptions(positional_parameters=queryargs))
         airportslist = [x for x in res]
         context = [queryprep]
 
@@ -77,7 +92,8 @@ class FlightPathsView(FlaskView):
                     UNION SELECT faa as toAirport,geo FROM `travel-sample` \
                     WHERE airportname = $2"
 
-        res = db.n1ql_query(N1QLQuery(queryprep, fromloc, toloc))
+        # res = db.n1ql_query(N1QLQuery(queryprep, fromloc, toloc))
+        res = cluster.query(queryprep, QueryOptions(positional_parameters=[fromloc,toloc]))
         flightpathlist = [x for x in res]
 
         # Extract the 'toAirport' and 'fromAirport' values.
@@ -95,8 +111,9 @@ class FlightPathsView(FlaskView):
 
         # http://localhost:5000/api/flightpaths/Nome/Teller%20Airport?leave=01/01/2016
         # should produce query with OME, TLA faa codes
-        resroutes = db.n1ql_query(
-            N1QLQuery(queryroutes, queryto, queryfrom, queryleave))
+        # resroutes = db.n1ql_query(
+        #     N1QLQuery(queryroutes, queryto, queryfrom, queryleave))
+        resroutes = cluster.query(queryroutes, QueryOptions(positional_parameters=[queryto, queryfrom, queryleave]))
         routelist = []
         for x in resroutes:
             x['flighttime'] = math.ceil(random() * 8000)
@@ -125,15 +142,17 @@ class UserView(FlaskView):
                 token = jwt.encode({'user': user}, 'cbtravelsample')
                 return jsonify({'data': {'token': token}})
 
-        except SubdocPathNotFoundError:
-            print("Password for user {} item does not exist".format(
-                userdockey))
-        except NotFoundError:
-            print("User {} item does not exist".format(userdockey))
-        except CouchbaseTransientError:
-            print("Transient error received - has Couchbase stopped running?")
-        except CouchbaseNetworkError:
-            print("Network error received - is Couchbase Server running on this host?")
+        except PathNotFoundException:
+             print("Password for user {} item does not exist".format(
+                 userdockey))
+        except DocumentNotFoundException:
+             print("User {} item does not exist".format(userdockey))
+        except CouchbaseTransientException:
+             print("Transient error received - has Couchbase stopped running?")
+        except NetworkException:
+             print("Network error received - is Couchbase Server running on this host?")
+        except CouchbaseException as e:
+            print("Unknown Exception detected during login - {}".format(e.rc))
 
         token = jwt.encode({'user': user}, 'cbtravelsample')
         return jsonify({'data': {'token': token}})
@@ -148,9 +167,10 @@ class UserView(FlaskView):
 
         try:
             db.upsert(make_user_key(user), userrec)
+            print("User created")
             token = jwt.encode({'user': user}, 'cbtravelsample')
-            respjson = jsonify({'data': {'token': token}})
-        except CouchbaseDataError as e:
+            respjson = jsonify({'data': {'token': token.decode('utf-8')}})
+        except CouchbaseDataException as e:
             abort(409)
         response = make_response(respjson)
         return response
@@ -171,7 +191,7 @@ class UserView(FlaskView):
                 respjson = jsonify({'data': flights[1]})
                 response = make_response(respjson)
                 return response
-            except NotFoundError:
+            except DocumentNotFoundException:
                 return abortmsg(500, "User does not exist")
 
         elif request.method == 'POST':
@@ -192,9 +212,9 @@ class UserView(FlaskView):
                 resjson = {'data': {'added': newflights},
                            'context': 'Update document ' + userdockey}
                 return make_response(jsonify(resjson))
-            except NotFoundError:
+            except DocumentNotFoundException:
                 return abortmsg(500, "User does not exist")
-            except CouchbaseDataError:
+            except CouchbaseDataException:
                 abortmsg(409, "Couldn't update flights")
 
 
@@ -206,22 +226,21 @@ class HotelView(FlaskView):
         """Find hotels using full text search"""
         # Requires FTS index called 'hotels'
         # TODO auto create index if missing
-        qp = FT.ConjunctionQuery(FT.TermQuery(term='hotel', field='type'))
+        # qp = FT.ConjunctionQuery(FT.TermQuery(term='hotel', field='type'))
+        qp = ConjunctionQuery(TermQuery("hotel", SearchOptions(fields=["type"])))
         if location != '*':
             qp.conjuncts.append(
-                FT.DisjunctionQuery(
-                    FT.MatchPhraseQuery(location, field='country'),
-                    FT.MatchPhraseQuery(location, field='city'),
-                    FT.MatchPhraseQuery(location, field='state'),
-                    FT.MatchPhraseQuery(location, field='address')
-                ))
+                    MatchPhraseQuery(location, SearchOptions(fields=["country", "city", "state", "address"]))
+                    # FT.MatchPhraseQuery(location, field='city'),
+                    # FT.MatchPhraseQuery(location, field='state'),
+                    # FT.MatchPhraseQuery(location, field='address')
+                )
 
         if description != '*':
             qp.conjuncts.append(
-                FT.DisjunctionQuery(
-                    FT.MatchPhraseQuery(description, field='description'),
-                    FT.MatchPhraseQuery(description, field='name')
-                ))
+                # FT.DisjunctionQuery(
+                    MatchPhraseQuery(description, SearchOptions(fields=['description', 'name']))
+                )
 
         q = db.search('hotels', qp, limit=100)
         results = []
@@ -261,11 +280,23 @@ app.add_url_rule('/api/airports', view_func=Airport.as_view('airports'),
                  methods=['GET', 'OPTIONS'])
 
 
-def connect_db():
-    return Bucket(CONNSTR, password=PASSWORD)
+def connect_cluster():
+    cluster = Cluster(CONNSTR, ClusterOptions(
+        PasswordAuthenticator(USER, PASSWORD)))
+    return cluster;
 
 
-db = connect_db()
+def connect_bucket(cluster):
+    return cluster.bucket('travel-sample')
+
+
+def connect_collection(bucket):
+    return bucket.default_collection()
+
+
+cluster = connect_cluster()
+bucket = connect_bucket(cluster)
+db = connect_collection(bucket)
 
 if __name__ == "__main__":
     app.run(debug=False, host='localhost', port=8080)
